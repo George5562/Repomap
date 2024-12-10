@@ -1,0 +1,45 @@
+flowchart TB
+    %% Define classes for colors
+    classDef page fill:#d0ebff
+    classDef component fill:#d3f9d8
+    classDef service fill:#ffe8cc
+    classDef config fill:#ffe3e3
+
+    subgraph app
+        layout([layout.tsx]):::page
+        page([page.tsx]):::page
+    end
+
+    subgraph components
+        ListingCard([ListingCard.tsx]):::component
+        NavBar([NavBar.tsx]):::component
+        LoginButton([LoginButton.tsx]):::component
+        style LoginButton stroke-dasharray: 5 5
+    end
+
+    subgraph config
+        listingType>listingType.ts]:::config
+        mockListings>mockListings.ts]:::config
+        authConfig>authConfig.ts]:::config
+        style authConfig stroke-dasharray: 5 5
+    end
+
+    subgraph services/logger
+        logger((logger.ts)):::service
+    end
+
+    subgraph services/auth
+        GoogleAuthService((GoogleAuthService.ts)):::service
+        style GoogleAuthService stroke-dasharray: 5 5
+    end
+
+    layout -- renders --> NavBar
+    page -- renders --> ListingCard
+    ListingCard -- uses --> listingType
+    mockListings -- uses --> listingType
+    ListingCard -- fetches from --> mockListings
+    NavBar -- calls --> logger
+    NavBar -. renders .-> LoginButton
+    LoginButton -. uses .-> GoogleAuthService
+    GoogleAuthService -. uses .-> authConfig
+    GoogleAuthService -. calls .-> logger
