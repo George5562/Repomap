@@ -2,6 +2,8 @@
 
 A tool to generate mermaid diagrams of your repo with one command, and visualise the elements to be added by any future updates via a CLI instruction (--add).
 
+A fork of Repomix by Kazuki Yamada: https://github.com/yamadashy/repomix
+
 ## Features
 
 - Generate directory structure flowcharts
