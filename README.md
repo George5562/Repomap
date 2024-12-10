@@ -2,7 +2,9 @@
 
 A tool to generate mermaid diagrams of your repo with one command, and visualise the elements to be added by any future updates via a CLI instruction (--add).
 
-A fork of Repomix by Kazuki Yamada: https://github.com/yamadashy/repomix
+Uses Repomix by Kazuki Yamada: https://github.com/yamadashy/repomix
+Mermaid: https://mermaid.js.org/
+Langchain: https://js.langchain.com/
 
 ## Features
 
