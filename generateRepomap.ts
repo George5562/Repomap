@@ -2,21 +2,39 @@
 
 /**
  * generateRepomap.ts
- * A  tool to visualize TypeScript codebases using Mermaid diagrams
+ * Visualizes TypeScript codebases as Mermaid diagrams with AI-powered analysis
  *
- * Key Features:
- * 1. Generates visual repository maps from TypeScript codebases
- * 2. Supports feature integration planning with AI assistance
- * 3. Creates role-based diagrams with automatic styling
- * 4. Uses GenAI for feature planning and code refactoring
+ * Core Features:
+ * - Generates visual repository maps from TypeScript codebases
+ * - Supports feature integration planning with AI assistance
+ * - Creates role-based diagrams with automatic styling
+ * - Implements font size scaling based on file complexity
+ * - Supports incremental updates with --no-repomix option
+ *
+ * Process Flow:
+ * 1. XML Generation: Analyze codebase structure using repomix
+ * 2. Data Parsing: Convert XML to structured format using Gemini
+ * 3. Diagram Creation: Generate Mermaid diagram using Claude
+ * 4. Feature Planning: (Optional) Visualize proposed features
+ *
+ * Dependencies:
+ * - repomix: Codebase analysis and XML generation
+ * - OpenRouter API: AI model access (Gemini, Claude)
+ * - Mermaid: Diagram rendering
  *
  * Usage:
  *   generateRepomap [directory] [--add "feature request"] [--no-repomix]
  *
  * Options:
- *   directory     - Target directory (defaults to current)
- *   --add         - Add a proposed feature to the diagram
- *   --no-repomix  - Skip repomix analysis, use existing files
+ *   directory     Target directory (defaults to current)
+ *   --add         Add a proposed feature to the diagram
+ *   --no-repomix  Skip repomix analysis, use existing files
+ *
+ * Environment:
+ *   LLM_API_KEY   OpenRouter API key (required)
+ *
+ * @author George Stephens
+ * @license MIT
  */
 
 //----------------------------------------
@@ -28,35 +46,235 @@ import * as path from "path";
 import * as dotenv from "dotenv";
 import * as os from "os";
 import { z } from "zod";
-import { ChatAnthropic } from "@langchain/anthropic";
+import { BaseChatModel } from "@langchain/core/language_models/chat_models";
+import { ChatMessage, BaseMessage } from "@langchain/core/messages";
+
+//----------------------------------------
+// Model Configuration
+//----------------------------------------
+/**
+ * XML Parsing Model (Steps 1-2)
+ * Gemini model optimized for structured data extraction
+ */
+const XML_PARSING_MODEL = "google/gemini-flash-1.5-8b";
+
+/**
+ * Diagram Generation Model (Step 3)
+ * Claude model for intelligent diagram creation and code understanding
+ */
+const DIAGRAM_GENERATION_MODEL = "anthropic/claude-3.5-sonnet:beta";
+
+/**
+ * Feature Planning Model (Step 4)
+ * Claude model for architectural analysis and feature integration
+ */
+const FEATURE_PLANNING_MODEL = "anthropic/claude-3.5-sonnet:beta";
+
+//----------------------------------------
+// Type Definitions
+//----------------------------------------
+/**
+ * IntermediateData Interface
+ * Structured format for codebase representation between XML and Mermaid
+ */
+interface IntermediateData {
+  files: {
+    path: string;
+    imports: string[];
+    exports: string[];
+    relationships: { type: string; target: string }[];
+  }[];
+  directories: string[];
+}
+
+//----------------------------------------
+// OpenRouter Integration
+//----------------------------------------
+/**
+ * OpenRouterChatModel
+ * Custom LangChain implementation for OpenRouter API
+ *
+ * Features:
+ * - Automatic retries with exponential backoff
+ * - Request timeout handling (default: 5 minutes)
+ * - JSON response parsing with markdown cleanup
+ * - Detailed error handling and reporting
+ */
+export class OpenRouterChatModel extends BaseChatModel {
+  private apiKey: string;
+  private model: string;
+  private siteUrl: string;
+  private siteName: string;
+  private maxRetries: number;
+  private timeout: number;
+
+  constructor(config: {
+    apiKey: string;
+    model?: string;
+    siteUrl?: string;
+    siteName?: string;
+    maxRetries?: number;
+    timeout?: number;
+  }) {
+    super({});
+    this.apiKey = config.apiKey;
+    this.model = config.model || "google/gemini-2.0-flash-exp:free";
+    this.siteUrl = config.siteUrl || "https://github.com/George5562/Repomap";
+    this.siteName = config.siteName || "RepoMap";
+    this.maxRetries = config.maxRetries || 3;
+    this.timeout = config.timeout || 300000;
+  }
+
+  _llmType(): string {
+    return "openrouter";
+  }
+
+  bindTools(tools: any[], kwargs?: any): any {
+    return this;
+  }
+
+  private async makeRequest(
+    messages: BaseMessage[],
+    attempt: number = 1
+  ): Promise<any> {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), this.timeout);
+
+      const response = await fetch(
+        "https://openrouter.ai/api/v1/chat/completions",
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+            "Content-Type": "application/json",
+            "HTTP-Referer": this.siteUrl,
+            "X-Title": this.siteName,
+          },
+          body: JSON.stringify({
+            model: this.model,
+            messages: messages.map((m) => ({
+              role: m._getType() === "human" ? "user" : m._getType(),
+              content: m.content,
+            })),
+          }),
+          signal: controller.signal,
+        }
+      );
+
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(
+          `OpenRouter API error: ${response.statusText}\n${errorText}`
+        );
+      }
+
+      const result = await response.json();
+
+      if (
+        !result.choices ||
+        !result.choices.length ||
+        !result.choices[0].message
+      ) {
+        throw new Error("Invalid response format from OpenRouter API");
+      }
+
+      return result;
+    } catch (error) {
+      if (attempt < this.maxRetries) {
+        console.log(
+          `\n⚠️ attempt ${attempt} failed, retrying in ${
+            attempt * 2
+          } seconds...`
+        );
+        await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
+        return this.makeRequest(messages, attempt + 1);
+      }
+      throw error;
+    }
+  }
+
+  async _generate(messages: BaseMessage[]): Promise<any> {
+    try {
+      const result = await this.makeRequest(messages);
+      const content = result.choices[0].message.content;
+
+      let parsedContent = content;
+      if (typeof content === "string") {
+        try {
+          // Remove markdown code block markers if present
+          const cleanContent = content.replace(/```json\n?|\n?```/g, "").trim();
+          parsedContent = JSON.parse(cleanContent);
+        } catch (e) {
+          // If not valid JSON, use as is
+          parsedContent = { diagram: content };
+        }
+      }
+
+      return {
+        generations: [
+          {
+            text:
+              typeof parsedContent === "object"
+                ? JSON.stringify(parsedContent)
+                : parsedContent,
+            message: new ChatMessage({
+              content:
+                typeof parsedContent === "object"
+                  ? JSON.stringify(parsedContent)
+                  : parsedContent,
+              role: result.choices[0].message.role || "assistant",
+            }),
+          },
+        ],
+      };
+    } catch (error) {
+      console.error("\n❌ API error details:", error);
+      throw error;
+    }
+  }
+}
 
 //----------------------------------------
 // Visual Style Configuration
 //----------------------------------------
+/**
+ * Role Definitions
+ * Maps file types to visual representations in the diagram
+ */
 const ROLE_DEFINITIONS = [
-  { role: "page", shape: "rectangle", color: "#d0ebff" }, // Light blue for pages
-  { role: "component", shape: "stadium", color: "#d3f9d8" }, // Light green for components
-  { role: "service", shape: "circle", color: "#ffe8cc" }, // Light orange for services
-  { role: "config", shape: "triangle", color: "#ffe3e3" }, // Light red for config
+  { role: "page", shape: "rectangle", color: "#d0ebff" }, // UI/routing files
+  { role: "component", shape: "stadium", color: "#d3f9d8" }, // Reusable UI elements
+  { role: "service", shape: "circle", color: "#ffe8cc" }, // Business logic
+  { role: "config", shape: "triangle", color: "#ffe3e3" }, // Configuration files
 ];
-// see more shapes at https://mermaid.js.org/syntax/flowchart.html#subgraphs
 
-// Valid relationship verbs for diagram connections
+/**
+ * Relationship Types
+ * Defines valid connection types between nodes
+ */
 const RELATIONSHIP_VERBS = [
-  "uses",
-  "calls",
-  "renders",
-  "fetches from",
-  "provides data to",
+  "uses", // General dependency
+  "calls", // Function/method invocation
+  "renders", // Component rendering
+  "fetches from", // Data retrieval
+  "provides data to", // Data provision
 ];
 
-// Font size scaling configuration based on file size
-const MIN_LINES = 100;
-const MAX_LINES = 500;
+/**
+ * Font Size Configuration
+ * Scales node text based on file complexity
+ */
+const MIN_LINES = 100; // Files ≤100 lines: 10px
+const MAX_LINES = 500; // Files ≥500 lines: 20px
 const MIN_FONT = 10;
 const MAX_FONT = 20;
 
-// Configuration paths
+/**
+ * Global Configuration Paths
+ */
 const HOME_DIR = os.homedir();
 const GLOBAL_CONFIG_DIR = path.join(HOME_DIR, ".config", "generateRepomap");
 const GLOBAL_CONFIG_FILE = path.join(GLOBAL_CONFIG_DIR, ".env");
@@ -83,12 +301,16 @@ if --no-repomix is specified, we skip running repomix and rely on previously gen
 // API Key Management
 //----------------------------------------
 /**
- * Retrieves the Anthropic API key from various sources in order:
+ * getApiKey
+ * Retrieves OpenRouter API key from available sources
+ *
+ * Search Order:
  * 1. Environment variable
  * 2. Local .env file
  * 3. Global config file
- * @returns {string} The API key if found
- * @throws {Error} If no API key is found
+ *
+ * @returns API key if found
+ * @throws Error if no API key is found
  */
 function getApiKey(): string {
   try {
@@ -109,8 +331,10 @@ function getApiKey(): string {
       if (process.env.LLM_API_KEY) return process.env.LLM_API_KEY;
     }
 
-    console.error("\n❌ api key not found.");
-    console.error("please set it via env var, local .env, or global config.");
+    console.error("\n❌ API key not found.");
+    console.error(
+      "please set LLM_API_KEY via env var, local .env, or global config."
+    );
     process.exit(1);
   } catch (error) {
     console.error(
@@ -125,47 +349,29 @@ function getApiKey(): string {
 // File System Operations
 //----------------------------------------
 /**
- * Creates the output directory if it doesn't exist
- * @param {string} outputDir - Path to the output directory
+ * runRepomix
+ * Executes repomix analysis on target directory
  */
-function prepareOutputDirectory(outputDir: string) {
-  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
-}
-
-/**
- * Verifies repomix installation and throws if not found
- * @throws {Error} If repomix is not installed
- */
-function checkRepomixInstallation() {
+function runRepomix(targetDir: string, outputFile: string) {
+  console.log("\n🔍 Step 1: Running repomix analysis...");
   try {
-    execSync("repomix --version", { stdio: "ignore" });
-  } catch {
-    throw new Error("repomix not installed. run: npm install -g repomix");
+    execSync(`npx repomix analyze "${targetDir}" -o "${outputFile}"`, {
+      stdio: "inherit",
+    });
+    console.log("✅ XML generation complete");
+  } catch (error) {
+    console.error("\n❌ Error in Step 1 - XML generation:", error);
+    throw error;
   }
 }
 
 /**
- * Executes repomix analysis on the target directory
- * @param {string} targetDir - Directory to analyze
- * @param {string} repomixOutputFile - Output file path
- * @throws {Error} If repomix execution fails
+ * prepareOutputDirectory
+ * Creates output directory if needed
  */
-function runRepomix(targetDir: string, repomixOutputFile: string) {
-  console.log(`\n🔍 analyzing dir: ${targetDir}`);
-  console.log(`📁 absolute path: ${path.resolve(targetDir)}`);
-  console.log(`📝 output file: ${repomixOutputFile}`);
-  checkRepomixInstallation();
-  const command = `repomix "${targetDir}" --style xml --include "**/*.ts,**/*.tsx,**/*.js,**/*.jsx" --ignore "**/node_modules/**,**/dist/**,**/.git/**" --output-show-line-numbers -o "${repomixOutputFile}"`;
-  console.log(`🔧 running command: ${command}`);
-  try {
-    execSync(command, { encoding: "utf8", stdio: ["inherit", "pipe", "pipe"] });
-  } catch (error) {
-    console.error("\n❌ repomix error details:", error);
-    throw new Error(
-      `failed to run repomix: ${
-        error instanceof Error ? error.message : String(error)
-      }`
-    );
+function prepareOutputDirectory(outputDir: string) {
+  if (!fs.existsSync(outputDir)) {
+    fs.mkdirSync(outputDir, { recursive: true });
   }
 }
 
@@ -173,14 +379,16 @@ function runRepomix(targetDir: string, repomixOutputFile: string) {
 // Schema Definitions
 //----------------------------------------
 /**
- * Zod schema for Mermaid diagram output
+ * Mermaid Diagram Schema
+ * Validates diagram output format
  */
 const diagramSchema = z.object({
   diagram: z.string().describe("mermaid diagram starting with 'flowchart TB'"),
 });
 
 /**
- * Zod schema for proposed feature changes
+ * Feature Changes Schema
+ * Validates proposed feature modifications
  */
 const changesSchema = z.object({
   newNodes: z.array(
@@ -209,251 +417,502 @@ const changesSchema = z.object({
 // Diagram Generation
 //----------------------------------------
 /**
- * Constructs CSS class definitions for role-based styling
- * @returns {string} Mermaid class definitions
+ * constructXmlParsingPrompt
+ * Creates prompt for XML to JSON conversion
+ *
+ * Guides model to:
+ * 1. Extract file metadata
+ * 2. Identify dependencies
+ * 3. Map relationships
+ * 4. Maintain structure
  */
-function constructRoleClassDefs(): string {
-  return ROLE_DEFINITIONS.map(
-    (r) =>
-      `classDef ${r.role} fill:${r.color},stroke:#333,stroke-width:1px,color:#fff;`
-  ).join("\n");
+function constructXmlParsingPrompt(xmlContent: string): string {
+  return `
+Given the repository structure in XML format, transform it into a JSON object that captures the following:
+
+---
+
+### 1. File Roles  
+Assign a **one-word role** for each file based on its functional purpose:
+
+| **Role**        | **Definition**                                                  | **Examples**                      |
+|-----------------|----------------------------------------------------------------|----------------------------------|
+| \`Page\`         | Files that define routes or pages.                              | \`Home.tsx\`, \`listing/route.ts\`   |
+| \`Component\`    | UI components and reusable visual elements.                     | \`Button.tsx\`, \`Header.tsx\`       |
+| \`Service\`      | Files providing logic, utilities, or external integrations.     | \`apiService.ts\`, \`dbConnect.ts\`  |
+| \`Config\`       | Files that store configuration, constants, or static content.   | \`apiConfig.ts\`, \`strings.ts\`     |
+| \`Context\`      | Context providers or custom hooks for state management.         | \`AuthContext.tsx\`, \`useFilters.ts\`|
+| \`Model\`        | Data models or interfaces.                                      | \`listings.ts\`, \`users.ts\`        |
+
+Each file must include its **role** in the JSON output.
+
+---
+
+### 2. Relationships  
+Analyze the relationships between files by parsing **import/export** statements. For each file, list its relationships in the style:
+
+\`\`\`json
+{
+  "filePath": "path/to/file.ts",
+  "role": "RoleName",
+  "relationships": [
+    {
+      "type": "RelationshipType",
+      "target": "path/to/targetFile",
+      "details": "Additional Details (e.g., function, type, interface)"
+    }
+  ]
+}
+\`\`\`
+
+**Table of Relationships**:
+
+| **Relationship Type**  | **Condition**                                              | **Details**                     |
+|------------------------|-----------------------------------------------------------|---------------------------------|
+| \`imports\`             | File imports another file.                                 | Include specific imports (functions, types, components). |
+| \`renders\`             | File imports a component or UI element.                    | Specify component name.         |
+| \`uses\`                | File imports a service, utility, or hook.                  | Function/service name.          |
+| \`configures\`          | File imports a configuration or constant.                  | Constant name or file.          |
+| \`exports\`             | File exports functions, components, types, or interfaces.  | Specify export name and type.   |
+| \`depends_on\`          | Logical dependency not captured through direct imports.    | High-level functional linkage.  |
+
+---
+
+### 3. File Path  
+For each file, include the **full file path** as provided in the XML input. Paths must be normalized to their absolute form.
+
+---
+
+### Final JSON Structure  
+
+The output JSON should follow this structure:
+
+\`\`\`json
+{
+  "files": [
+    {
+      "filePath": "path/to/file.ts",
+      "role": "Component",
+      "relationships": [
+        {
+          "type": "imports",
+          "target": "path/to/service.ts",
+          "details": "apiService function"
+        },
+        {
+          "type": "renders",
+          "target": "path/to/Header.tsx",
+          "details": "Header component"
+        }
+      ]
+    },
+    {
+      "filePath": "path/to/config/apiConfig.ts",
+      "role": "Config",
+      "relationships": []
+    }
+  ]
+}
+\`\`\`
+
+---
+
+### Requirements for the LLM  
+
+1. Parse the XML input to extract:
+   - File paths.
+   - Import/export statements for each file.
+2. Identify what is being imported/exported within each file.
+3. Assign one of the pre-defined **roles** to each file based on its content.
+4. Derive all relationships (e.g., \`imports\`, \`renders\`, \`configures\`) for each file.
+5. Normalize and include the file path in absolute form.
+
+Ensure the output is **clean, formatted JSON** with no missing details.
+
+XML Content:
+${xmlContent}`;
 }
 
 /**
- * Creates note about valid relationship verbs
- * @returns {string} Formatted relationship note
+ * parseXmlToUnstructuredMap
+ * Converts repomix XML to IntermediateData format
+ *
+ * @param content Raw XML from repomix
+ * @returns Structured codebase representation
  */
-function constructRelationshipsNote(): string {
-  return `you can use these verbs: ${RELATIONSHIP_VERBS.join(
-    ", "
-  )}. pick what's most relevant.`;
-}
+async function parseXmlToUnstructuredMap(
+  content: string
+): Promise<IntermediateData> {
+  console.log("\n📊 Step 2/4: Parsing XML structure");
 
-//----------------------------------------
-// LLM Integration
-//----------------------------------------
-/**
- * Generates base repository map using Claude
- * @param {string} xmlContent - Repomix XML output
- * @param {string} rolesString - Role class definitions
- * @param {string} relationshipsNote - Relationship documentation
- * @returns {Promise<string>} Generated Mermaid diagram
- */
-async function processWithStructuredOutput(
-  xmlContent: string
-): Promise<string> {
-  console.log("\n🤖 generating base repomap...");
   const apiKey = getApiKey();
-  const model = new ChatAnthropic({
-    anthropicApiKey: apiKey,
-    modelName: "claude-3-5-sonnet-latest",
-    temperature: 0,
-  });
-  const structuredModel = model.withStructuredOutput(diagramSchema, {
-    name: "diagram_response",
-  });
 
-  // updated prompt with subgraph instructions
-  const prompt = `
-you have a ts codebase in repomix xml form. produce a mermaid diagram with node types for each roles, subgraphs for each subdirectory, and named edges between nodes denoting the relationship. Use specific bracket syntax for shapes AND apply color classes:
+  try {
+    const response = await fetch(
+      "https://openrouter.ai/api/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": "https://github.com/George5562/Repomap",
+          "X-Title": "RepoMap",
+        },
+        body: JSON.stringify({
+          model: XML_PARSING_MODEL,
+          response_format: { type: "json_object" },
+          messages: [
+            {
+              role: "system",
+              content: `You are a code analysis assistant that extracts structured information from codebase content.
+Your responses should always be valid JSON objects in the following format:
+{
+  "files": [
+    {
+      "path": "string",
+      "imports": ["string"],
+      "exports": ["string"],
+      "relationships": [
+        {
+          "type": "string (uses|renders|fetches from|provides data to)",
+          "target": "string (normalized path)"
+        }
+      ]
+    }
+  ],
+  "directories": ["string"]
+}
 
-flowchart TB  
-    %% First define class styling for colors
-    ClassDef *roles*
-    
-    subgraph subdirectory1
-        %% Use bracket syntax for shapes:
-        %% ((text)) for circles
-        %% ([text]) for rounded rectangles
-        %% [[text]] for subroutines
-        %% >text] for flags
-        %% {text} for rhombus
-        file1(([File 1])):::role1
-        file2([File 2]):::role2
-    end
-    
-    subgraph subdirectory2
-        file3[[File 3]]:::role1
-        file4>File 4]:::role2
-    end
+Important:
+1. Ensure all relative imports are normalized to absolute paths
+2. Every import should have a corresponding relationship
+3. Use appropriate relationship types based on what is being imported
+4. Return ONLY valid JSON, no markdown or additional text`,
+            },
+            {
+              role: "user",
+              content: constructXmlParsingPrompt(content),
+            },
+          ],
+        }),
+      }
+    );
 
-    file1 -- relationship1 --> file2
-    file1 -- relationship1 --> file3
-    file2 -- relationship3 --> file4
-    file3 -- relationship2 --> file4
-    file4 -- relationship5 --> file1
+    if (!response.ok) {
+      throw new Error(`API error: ${response.statusText}`);
+    }
 
+    const result = await response.json();
+    if (!result.choices?.[0]?.message?.content) {
+      throw new Error("Invalid API response format");
+    }
 
-instructions:
-1. parse the xml to find each file's role. 
-2. roles, shapes and colors:
-${ROLE_DEFINITIONS.map((r) => `- ${r.role} (${r.shape}, ${r.color})`).join(
-  "\n"
-)}, adding classDefs for each into the code.
-3. Assign each file a role from ${ROLE_DEFINITIONS.map((r) => r.role).join(
-    ", "
-  )}
-4. For each node:
-   - Use appropriate bracket syntax for the shape based on role
-   - Apply color class using :::rolename syntax
-5. group nodes into subgraphs by directory
-6. name edges by relationship, choosing from this list: ${RELATIONSHIP_VERBS.join(
-    ", "
-  )} e.g. page "renders" component, component "calls" service, service "fetches from" config.
-7. output only a json { "diagram": "..." } with no extra commentary.
+    let parsed;
+    const rawContent = result.choices[0].message.content;
 
-xml:
-${xmlContent}
-`;
+    try {
+      // First try: direct JSON parse
+      parsed =
+        typeof rawContent === "object" ? rawContent : JSON.parse(rawContent);
+    } catch (e) {
+      try {
+        // Second try: clean up markdown and comments
+        const cleaned = rawContent
+          .replace(/```json\n?|\n?```/g, "")
+          .replace(/\/\/.+/g, "") // Remove single line comments
+          .replace(/\/\*[\s\S]*?\*\//g, "") // Remove multi-line comments
+          .trim();
+        parsed = JSON.parse(cleaned);
+      } catch (e2) {
+        // Last resort: aggressive cleanup
+        const aggressive = rawContent
+          .replace(/```[\s\S]*?```/g, "") // Remove all code blocks
+          .replace(/[^\x20-\x7E]/g, "") // Remove non-printable characters
+          .replace(/\/\/.+/g, "") // Remove comments
+          .replace(/\/\*[\s\S]*?\*\//g, "") // Remove multi-line comments
+          .replace(/,(\s*[}\]])/g, "$1") // Remove trailing commas
+          .replace(/\s+/g, " ") // Normalize whitespace
+          .replace(/([{,]\s*)([a-zA-Z0-9_]+):/g, '$1"$2":') // Quote unquoted keys
+          .trim();
 
-  const response = await structuredModel.invoke(prompt);
-  const diagram = response.diagram.trim();
-  if (!diagram.startsWith("flowchart TB"))
-    throw new Error("diagram must start with 'flowchart TB'");
-  return diagram;
+        // Find the first { and last }, take only that substring
+        const start = aggressive.indexOf("{");
+        const end = aggressive.lastIndexOf("}") + 1;
+        if (start >= 0 && end > start) {
+          const jsonStr = aggressive.substring(start, end);
+          parsed = JSON.parse(jsonStr);
+        } else {
+          throw new Error("Could not find valid JSON structure in response");
+        }
+      }
+    }
+
+    // Basic structure validation
+    if (!parsed.files || !Array.isArray(parsed.files)) {
+      parsed = {
+        files: [],
+        directories: [],
+      };
+    }
+
+    // Ensure each file has the required properties
+    parsed.files = parsed.files.map((file: any) => ({
+      path: file.path || "",
+      imports: Array.isArray(file.imports) ? file.imports : [],
+      exports: Array.isArray(file.exports) ? file.exports : [],
+      relationships: Array.isArray(file.relationships)
+        ? file.relationships
+        : [],
+    }));
+
+    // Ensure directories is an array
+    if (!Array.isArray(parsed.directories)) {
+      parsed.directories = [];
+    }
+
+    return parsed as IntermediateData;
+  } catch (error) {
+    console.error("⚠️ XML parsing failed, returning empty structure");
+    return {
+      files: [],
+      directories: [],
+    };
+  }
 }
 
 /**
- * Plans changes for new feature integration
- * @param {string} repomixXml - Repomix XML output
- * @param {string} featureRequest - User's feature request
- * @returns {Promise<z.infer<typeof changesSchema>>} Planned changes
+ * generateMermaidDiagram
+ * Creates Mermaid diagram from IntermediateData
+ *
+ * @param structureData Parsed codebase structure
+ * @returns Mermaid diagram syntax
+ */
+async function generateMermaidDiagram(
+  structureData: IntermediateData
+): Promise<string> {
+  console.log("\n🎨 Step 3/4: Generating diagram");
+
+  const apiKey = getApiKey();
+
+  try {
+    const response = await fetch(
+      "https://openrouter.ai/api/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+          "HTTP-Referer": "https://github.com/George5562/Repomap",
+          "X-Title": "RepoMap",
+        },
+        body: JSON.stringify({
+          model: DIAGRAM_GENERATION_MODEL,
+          messages: [
+            {
+              role: "system",
+              content: `You are a diagram generation assistant that creates Mermaid flowcharts from codebase structures.
+                Your responses must always start with 'flowchart TB' and use correct Mermaid syntax.
+
+                ### Class Definitions:
+                Define these styles for the roles:
+                classDef page fill:#d0ebff,stroke:#333,stroke-width:1px,color:#fff,shape:rect;
+                classDef component fill:#d3f9d8,stroke:#333,stroke-width:1px,color:#fff,shape:round;
+                classDef service fill:#ffe8cc,stroke:#333,stroke-width:1px,color:#fff,shape:diamond;
+                classDef config fill:#ffe3e3,stroke:#333,stroke-width:1px,color:#fff,shape:parallelogram;
+                classDef model fill:#f8f9fa,stroke:#333,stroke-width:1px,color:#333,shape:ellipse;
+                classDef context fill:#fef9c3,stroke:#333,stroke-width:1px,color:#333,shape:hexagon;
+
+                ### Relationship Rules:
+                - Use the 'imports' relationship only to avoid duplication.
+                - Format the arrow text as follows:
+                  **type:** followed by the details of the relationship.
+
+                Example:
+                listing.ts -- **imports:** apiService function --> nextauth.ts
+                `,
+            },
+            {
+              role: "user",
+              content: `Create a Mermaid flowchart from this codebase structure:
+
+${JSON.stringify(structureData, null, 2)}
+
+### Instructions:
+1. Start the diagram with 'flowchart TB'.
+2. Group related nodes into subgraphs based on their directory structure.
+3. Use the appropriate classDef styles for each node based on its role:
+   - Page → class: page
+   - Component → class: component
+   - Service → class: service
+   - Config → class: config
+   - Model → class: model
+   - Context → class: context
+4. Map the relationships using arrows with proper labels:
+   - Arrow text must include the bold **type:** followed by 'details'.
+   - Example: listing.ts -- **imports:** apiService function --> nextauth.ts
+5. Escape node names containing square brackets (e.g., replace \[...\] with \\[...\\]) to avoid Mermaid syntax errors.
+6. Ensure the diagram is clean and maintainable. **Return ONLY the Mermaid diagram syntax.**`,
+            },
+          ],
+        }),
+      }
+    );
+
+    const data = await response.json();
+    const diagram = data.choices?.[0]?.message?.content;
+
+    if (diagram) {
+      return diagram;
+    } else {
+      throw new Error("No Mermaid diagram generated.");
+    }
+  } catch (error) {
+    console.error("Error generating Mermaid diagram:", error);
+    throw error;
+  }
+}
+
+//----------------------------------------
+// Feature Planning
+//----------------------------------------
+/**
+ * getProposedChanges
+ * Plans changes for requested feature
  */
 async function getProposedChanges(
-  repomixXml: string,
+  structureData: IntermediateData,
   featureRequest: string
-): Promise<z.infer<typeof changesSchema>> {
-  console.log("\n🧩 planning new feature changes...");
+): Promise<any> {
+  console.log("\n🎯 Planning feature changes...");
   const apiKey = getApiKey();
-  const model = new ChatAnthropic({
-    anthropicApiKey: apiKey,
-    modelName: "claude-3-5-sonnet-latest",
-    temperature: 0,
-  });
-  const structuredModel = model.withStructuredOutput(changesSchema, {
-    name: "proposed_changes",
+  const model = new OpenRouterChatModel({
+    apiKey,
+    model: FEATURE_PLANNING_MODEL,
+    siteUrl: "https://github.com/George5562/repomap",
+    siteName: "RepoMap",
   });
 
-  // updated prompt to include the explanation
-  const prompt = `
-you have a ts codebase in repomix xml and a user wants to add a new feature.
-
-user request: "${featureRequest}"
-
-instructions:
-1. analyze xml to understand code structure.
-2. propose new nodes/edges for the feature:
-   for files: newNodes: {id, label, role}
-   for relationships: newEdges: {from, to, relationship, proposed:true}
-3. in addition to newNodes and newEdges, also include an "explanation" field in the returned json:
-   "explanation": "a verbose english description of the reasoning behind these changes, e.g. 'to add search, we introduce a search service which ...', etc."
-   this should describe what was added and why, in human-friendly language.
-4. return only { "newNodes": [...], "newEdges": [...], "explanation": "..." } json, no mermaid code.
-5. use roles and relationship verbs as before.
-6. feature should fit logically with existing structure.
-
-xml:
-${repomixXml}
-`;
-
-  const response = await structuredModel.invoke(prompt);
-  return response;
+  const structuredModel = model.withStructuredOutput(changesSchema);
+  return await structuredModel.invoke(
+    constructFeaturePrompt(structureData, featureRequest)
+  );
 }
 
 /**
+ * integrateChangesIntoDiagram
  * Integrates proposed changes into existing diagram
- * @param {string} originalDiagram - Base Mermaid diagram
- * @param {z.infer<typeof changesSchema>} changes - Proposed changes
- * @returns {Promise<string>} Updated Mermaid diagram
  */
 async function integrateChangesIntoDiagram(
-  originalDiagram: string,
-  changes: z.infer<typeof changesSchema>
+  baseDiagram: string,
+  changes: any
 ): Promise<string> {
-  console.log("\n🔧 integrating proposed changes...");
+  console.log("\n🔄 Integrating changes into diagram...");
   const apiKey = getApiKey();
-  const model = new ChatAnthropic({
-    anthropicApiKey: apiKey,
-    modelName: "claude-3-5-sonnet-latest",
-    temperature: 0,
-  });
-  const structuredModel = model.withStructuredOutput(diagramSchema, {
-    name: "diagram_response",
+  const model = new OpenRouterChatModel({
+    apiKey,
+    model: FEATURE_PLANNING_MODEL,
+    siteUrl: "https://github.com/George5562/repomap",
+    siteName: "RepoMap",
   });
 
-  const prompt = `
-you have an original mermaid diagram and proposed changes.
+  const structuredModel = model.withStructuredOutput(diagramSchema);
+  return (
+    await structuredModel.invoke(
+      constructIntegrationPrompt(baseDiagram, changes)
+    )
+  ).diagram;
+}
 
-original:
-${originalDiagram}
+/**
+ * constructFeaturePrompt
+ * Creates prompt for feature planning
+ */
+function constructFeaturePrompt(
+  structureData: IntermediateData,
+  featureRequest: string
+): string {
+  return `
+analyze this TypeScript codebase and propose changes for the requested feature.
+suggest new components and their relationships while maintaining existing architecture.
 
-changes:
+feature request: "${featureRequest}"
+
+current structure:
+${JSON.stringify(structureData, null, 2)}
+
+instructions:
+1. analyze the current codebase structure
+2. propose new components needed for the feature
+3. define relationships between new and existing components
+4. use available roles: ${ROLE_DEFINITIONS.map((r) => r.role).join(", ")}
+5. use relationship types: ${RELATIONSHIP_VERBS.join(", ")}
+`;
+}
+
+/**
+ * constructIntegrationPrompt
+ * Creates prompt for integrating changes
+ */
+function constructIntegrationPrompt(baseDiagram: string, changes: any): string {
+  return `
+integrate these proposed changes into the existing mermaid diagram.
+maintain consistent styling and structure while adding new components.
+
+base diagram:
+${baseDiagram}
+
+proposed changes:
 ${JSON.stringify(changes, null, 2)}
 
 instructions:
-1. inspect the original diagram to understand current roles, classes, subgraphs, and relationships:
-   - analyze how existing nodes use bracket syntax for shapes (e.g., ((text)) for circles, ([text]) for rounded rectangles)
-   - note the classDefs and color assignments using :::rolename syntax
-   - understand the existing subgraph structure
-
-2. add new nodes using the same shape conventions but with dashed styling:
-   - use the SAME bracket syntax as existing nodes of the same role:
-     * ((text)) for circles
-     * ([text]) for rounded rectangles
-     * [[text]] for subroutines
-     * >text] for flags
-     * {text} for rhombus
-   - apply appropriate color class using :::rolename
-   - add style override for dashed border: style nodeName stroke-dasharray: 5 5
-   - group in appropriate subgraph based on directory
-
-3. add new relationships with dashed lines:
-   - use dotted arrow syntax: A-. "relationship" .->B
-   - use relationship verbs from this list: ${RELATIONSHIP_VERBS.join(", ")}
-   - maintain existing relationships unchanged
-   - new relationships to/from existing nodes should use dashed lines
-
-4. maintain diagram structure:
-   - keep 'flowchart TB' at the start
-   - preserve all existing nodes, edges, and subgraphs exactly as they are
-   - maintain all existing classDefs
-   - if adding new roles, add their classDefs in the same style
-   - place new subgraphs (if needed) after existing ones
-
-5. output only a json with a "diagram" key containing the updated mermaid code.
-   do not include extra commentary or code fences.
-
-example of new node with dashed style:
-  newNode(([New Feature])):::role1
-  style newNode stroke-dasharray: 5 5
-
-example of new relationship:
-  newNode-. "uses" .->existingNode
-
-the goal is to have a coherent updated diagram that integrates the new components while clearly distinguishing them with dashed lines but maintaining consistent shapes and colors with existing nodes of the same role.
+1. preserve existing diagram structure and styling
+2. add new nodes with correct shapes and colors
+3. integrate new relationships
+4. maintain flowchart TB direction
+5. ensure all style definitions are preserved
 `;
+}
 
-  const response = await structuredModel.invoke(prompt);
-  const diagram = response.diagram.trim();
-  if (!diagram.startsWith("flowchart TB"))
-    throw new Error("updated diagram must start with 'flowchart TB'");
-  return diagram;
+/**
+ * planAndVisualizeFeature
+ * Plans and visualizes new feature additions
+ *
+ * @param structureData Current codebase structure
+ * @param featureRequest Requested feature description
+ * @param baseDiagram Existing Mermaid diagram
+ * @returns Updated diagram with new features
+ */
+async function planAndVisualizeFeature(
+  structureData: IntermediateData,
+  featureRequest: string,
+  baseDiagram: string
+): Promise<string> {
+  console.log("\n✨ Step 4/4: Planning feature");
+
+  const changes = await getProposedChanges(structureData, featureRequest);
+  const updatedDiagram = await integrateChangesIntoDiagram(
+    baseDiagram,
+    changes
+  );
+  return updatedDiagram;
 }
 
 //----------------------------------------
 // File Operations
 //----------------------------------------
 /**
- * Saves Mermaid diagram to file
- * @param {string} mermaidSyntax - Diagram content
- * @param {string} mermaidFile - Output file path
+ * saveDiagram
+ * Writes Mermaid diagram to file
  */
-function saveDiagram(mermaidSyntax: string, mermaidFile: string) {
-  console.log(`\n💾 saving repomap to ${mermaidFile}...`);
+function saveDiagram(mermaidSyntax: string, mermaidFile: string): void {
   fs.writeFileSync(mermaidFile, mermaidSyntax, { flag: "w" });
-  console.log(`✅ saved ${mermaidFile}`);
+  console.log(`✅ Saved: ${path.basename(mermaidFile)}`);
 }
 
+/**
+ * sanitizeFeatureName
+ * Converts feature request to valid filename
+ */
 function sanitizeFeatureName(featureRequest: string): string {
   return featureRequest
     .toLowerCase()
@@ -488,6 +947,7 @@ function applyFontSizeScaling(
 // Line Count Processing
 //----------------------------------------
 /**
+ * parseLineCountsFromRepomix
  * Extracts line counts from repomix output
  */
 function parseLineCountsFromRepomix(repofile: string): Map<string, number> {
@@ -512,6 +972,10 @@ function parseLineCountsFromRepomix(repofile: string): Map<string, number> {
 
 /**
  * Calculates font size based on line count
+ * Rules:
+ * - Files ≤ MIN_LINES get MIN_FONT size
+ * - Files ≥ MAX_LINES get MAX_FONT size
+ * - Files in between get proportionally scaled size
  */
 function calculateFontSize(lines: number): number {
   if (lines <= MIN_LINES) return MIN_FONT;
@@ -521,8 +985,15 @@ function calculateFontSize(lines: number): number {
 }
 
 //----------------------------------------
-// main
+// Main Program Flow
 //----------------------------------------
+/**
+ * Main function orchestrating the four-step process:
+- * 1. Generate XML with repomix
+- * 2. Parse to IntermediateData using Gemini
+- * 3. Create Mermaid diagram using Claude
+- * 4. (Optional) Add feature visualization
+- */
 async function generateRepomap() {
   const args = process.argv.slice(2);
 
@@ -531,16 +1002,20 @@ async function generateRepomap() {
     process.exit(0);
   }
 
+  // Parse command line arguments
   let featureRequest: string | null = null;
   const addIndex = args.indexOf("--add");
-  if (addIndex !== -1 && args[addIndex + 1])
+  if (addIndex !== -1 && args[addIndex + 1]) {
     featureRequest = args[addIndex + 1];
+  }
 
   const noRepomix = args.includes("--no-repomix");
   const targetDir =
     args[0] && args[0] !== "--add" && args[0] !== "--no-repomix"
       ? path.resolve(args[0])
       : process.cwd();
+
+  // Setup output directories
   const dirName = path.basename(targetDir);
   const OUTPUT_DIR = path.join(targetDir, "repomap_output");
   prepareOutputDirectory(OUTPUT_DIR);
@@ -552,81 +1027,79 @@ async function generateRepomap() {
     : path.join(OUTPUT_DIR, `${dirName}_repomap.mmd`);
 
   try {
-    console.log("\n🚀 starting repomap generation...");
+    console.log("\n🚀 Step 1/4: Analyzing codebase");
 
+    // Step 1: Generate XML using repomix
     if (!noRepomix) {
-      runRepomix(targetDir, REPOMIX_OUTPUT_FILE);
-    } else {
-      if (!fs.existsSync(REPOMIX_OUTPUT_FILE) || !fs.existsSync(BASE_FILE)) {
-        throw new Error(
-          `--no-repomix set but missing base diagram or repomix-output.xml. run without --no-repomix first.`
-        );
-      }
-    }
-
-    if (!fs.existsSync(REPOMIX_OUTPUT_FILE)) {
+      execSync(
+        `npx repomix analyze "${targetDir}" -o "${REPOMIX_OUTPUT_FILE}"`,
+        {
+          stdio: ["ignore", "pipe", "pipe"],
+        }
+      );
+    } else if (!fs.existsSync(REPOMIX_OUTPUT_FILE)) {
       throw new Error(
-        "no repomix-output.xml found, run without --no-repomix first."
+        "No repomix-output.xml found. Run without --no-repomix first."
       );
     }
-    const lineCountMap = parseLineCountsFromRepomix(REPOMIX_OUTPUT_FILE);
 
-    let baseDiagram: string;
+    // Step 2: Parse XML to intermediate format
+    const repomixXml = fs.readFileSync(REPOMIX_OUTPUT_FILE, "utf8");
+    const structureData = await parseXmlToUnstructuredMap(repomixXml);
+
+    // Step 3: Generate base Mermaid diagram
+    let diagram: string;
     if (!fs.existsSync(BASE_FILE) && !noRepomix) {
-      const repomixXml = fs.readFileSync(REPOMIX_OUTPUT_FILE, "utf8");
-      baseDiagram = await processWithStructuredOutput(repomixXml);
-      baseDiagram = applyFontSizeScaling(baseDiagram, lineCountMap);
-      saveDiagram(baseDiagram, BASE_FILE);
+      diagram = await generateMermaidDiagram(structureData);
+      diagram = applyFontSizeScaling(
+        diagram,
+        parseLineCountsFromRepomix(REPOMIX_OUTPUT_FILE)
+      );
+      saveDiagram(diagram, BASE_FILE);
     } else {
-      baseDiagram = fs.readFileSync(BASE_FILE, "utf8");
+      diagram = fs.readFileSync(BASE_FILE, "utf8");
+      console.log("📄 Using existing base diagram");
     }
 
-    console.log(`\n✅ base repomap diagram at ${BASE_FILE}`);
-
+    // Step 4: (Optional) Add feature visualization
     if (featureRequest) {
-      console.log(`\n📜 feature request: "${featureRequest}"`);
-      const repomixXml = fs.readFileSync(REPOMIX_OUTPUT_FILE, "utf8");
-      const changesPlan = await getProposedChanges(repomixXml, featureRequest);
-
-      const safeFeatureName = sanitizeFeatureName(featureRequest);
-      const CHANGES_FILE = path.join(OUTPUT_DIR, `add_${safeFeatureName}.json`);
-      console.log(`\n💾 saving proposed changes to ${CHANGES_FILE}...`);
-      fs.writeFileSync(CHANGES_FILE, JSON.stringify(changesPlan, null, 2));
-      console.log(`✅ saved ${CHANGES_FILE}`);
-
-      let updatedDiagram = await integrateChangesIntoDiagram(
-        baseDiagram,
-        changesPlan
+      diagram = await planAndVisualizeFeature(
+        structureData,
+        featureRequest,
+        diagram
       );
-      updatedDiagram = applyFontSizeScaling(updatedDiagram, lineCountMap);
-      saveDiagram(updatedDiagram, FINAL_FILE);
-
-      console.log(
-        `\n✅ updated repomap with proposed features saved to ${FINAL_FILE}`
+      diagram = applyFontSizeScaling(
+        diagram,
+        parseLineCountsFromRepomix(REPOMIX_OUTPUT_FILE)
       );
+      saveDiagram(diagram, FINAL_FILE);
     } else {
-      console.log("\nno features requested. done.");
       fs.copyFileSync(BASE_FILE, FINAL_FILE);
-      console.log(`✅ copied base to ${FINAL_FILE} too.`);
+      saveDiagram(diagram, FINAL_FILE);
     }
 
-    console.log("\nyou can view the .mmd file on github or use mermaid cli:");
+    // Output viewing instructions
+    console.log("\n📋 View options:");
+    console.log("1. Open in GitHub (supports .mmd files)");
     console.log(
-      `  mmdc -i "${FINAL_FILE}" -o "${FINAL_FILE.replace(".mmd", ".svg")}"\n`
+      "2. Generate SVG: mmdc -i",
+      path.basename(FINAL_FILE),
+      "-o",
+      path.basename(FINAL_FILE).replace(".mmd", ".svg")
     );
   } catch (error) {
     console.error(
-      "\n❌ error generating repomap:",
+      "\n❌ Error:",
       error instanceof Error ? error.message : String(error)
     );
     process.exit(1);
   }
 }
 
-// run
+// Execute main program
 generateRepomap().catch((err) => {
   console.error(
-    "\n❌ unexpected error:",
+    "\n❌ Unexpected error:",
     err instanceof Error ? err.message : String(err)
   );
   process.exit(1);

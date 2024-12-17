@@ -1,94 +1,162 @@
-# Repomix Directory Visualizer (Now & Future)
+# Project Mindmap Generator
 
-A tool to generate mermaid diagrams of your repo with one command, and visualise the elements to be added by any future updates via a CLI instruction (--add).
+A TypeScript tool that generates visual diagrams of your codebase using AI assistance. Creates Mermaid diagrams showing current structure and can visualize proposed feature additions through natural language requests.
 
-Uses Repomix by Kazuki Yamada: https://github.com/yamadashy/repomix
-Mermaid: https://mermaid.js.org/
-Langchain: https://js.langchain.com/
+## Key Features
 
-## Features
+- **AI-Powered Analysis**: Uses multiple specialized models for different tasks
+- **Role-Based Visualization**: Automatically categorizes files by their function
+- **Feature Planning**: Visualizes proposed features through natural language
+- **Adaptive Styling**: Font sizes scale with file complexity
+- **Incremental Updates**: Supports partial updates with `--no-repomix`
 
-- Generate directory structure flowcharts
-- Plan new features using natural language
-- Output structured implementation suggestions
-- Customize node types and relationships
-- Node font size (and subsequent node size) based on number of lines in the file
+## Dependencies
 
-## Important Notes
-
-⚠️ **Large Repositories**: The entire file structure is fed to the LLM, so be mindful with large codebases. Use scoping options to restrict analysis:
-
-```bash
-# Include only specific patterns
-repomix --include "src/**/*.ts,**/*.md"
-
-# Exclude specific patterns
-repomix --ignore "**/*.log,tmp/"
-```
+- **repomix**: Codebase analysis and XML generation
+- **OpenRouter API**: Access to multiple AI models (required)
+- **Mermaid**: Diagram rendering
+- **LangChain**: AI model integration
+- **Zod**: Schema validation
 
 ## Installation
 
-### Global Installation
+### Prerequisites
 
-1. Install Node.js and npm
-2. Run:
+1. Node.js (v18 or later)
+2. npm (v8 or later)
+3. OpenRouter API key from https://openrouter.ai/
+
+### Setup
+
+1. Clone the repository:
+
    ```bash
-   chmod +x install_globally.sh
-   ./install_globally.sh
-   ```
-3. Create `.env` with your Anthropic API key:
-   ```
-   LLM_API_KEY=your_anthropic_key_here
+   git clone https://github.com/yourusername/project_mindmap.git
+   cd project_mindmap
    ```
 
-### Local Installation
+2. Install dependencies:
 
-1. Create project directory:
    ```bash
-   mkdir my-repomap && cd my-repomap
+   npm install
    ```
-2. Download `generateRepomap.ts` and `run_locally.sh`
-3. Run setup:
+
+3. Configure API key (choose one method):
+
    ```bash
-   chmod +x run_locally.sh
-   ./run_locally.sh
+   # Environment variable
+   export LLM_API_KEY=your_openrouter_api_key_here
+
+   # Local .env file
+   echo "LLM_API_KEY=your_openrouter_api_key_here" > .env
+
+   # Global config
+   mkdir -p ~/.config/generateRepomap
+   echo "LLM_API_KEY=your_openrouter_api_key_here" > ~/.config/generateRepomap/.env
    ```
-4. Edit `.env` with your Anthropic API key
 
 ## Usage
 
-### Basic Usage
+### Basic Diagram Generation
 
 ```bash
-# Global
-repomap-cli [directory]
+# Generate diagram for current directory
+npx ts-node generateRepomap.ts
 
-# Local
-npm run repomap [directory]
+# Generate diagram for specific directory
+npx ts-node generateRepomap.ts ./src
 ```
 
 ### Feature Planning
 
 ```bash
-repomap-cli [directory] --add "add a search feature"
+# Add a proposed feature to the diagram
+npx ts-node generateRepomap.ts --add "add a search feature"
+
+# Skip repomix analysis when planning features
+npx ts-node generateRepomap.ts --no-repomix --add "add authentication"
 ```
 
-### Skip Analysis
+### Output Files
 
-```bash
-repomap-cli [directory] --no-repomix
+Generated in `./repomap_output/`:
+
+- `repomix-output.xml`: Raw codebase analysis
+- `{dirname}_base_repomap.mmd`: Current structure diagram
+- `add_{feature_name}.mmd`: Feature planning diagram (if requested)
+
+## AI Model Pipeline
+
+The tool uses OpenRouter to access different AI models optimized for each step:
+
+1. **XML Parsing** (Gemini Flash 1.5-8b)
+
+   - Processes large XML files from repomix
+   - Efficient at structured data extraction
+   - Large context window (handles full codebase)
+
+2. **Diagram Generation** (Claude 3.5 Sonnet)
+
+   - Creates Mermaid diagrams
+   - Strong code understanding
+   - Graph relationship modeling
+
+3. **Feature Planning** (Claude 3.5 Sonnet)
+   - Architectural analysis
+   - Feature impact assessment
+   - Integration planning
+
+## File Role Categories
+
+Files are automatically categorized into roles:
+
+| Role      | Purpose            | Examples                           |
+| --------- | ------------------ | ---------------------------------- |
+| Page      | Routes/Pages       | `Home.tsx`, `listing/route.ts`     |
+| Component | UI Elements        | `Button.tsx`, `Header.tsx`         |
+| Service   | Logic/Integration  | `apiService.ts`, `dbConnect.ts`    |
+| Config    | Settings/Constants | `apiConfig.ts`, `strings.ts`       |
+| Context   | State Management   | `AuthContext.tsx`, `useFilters.ts` |
+| Model     | Data Structures    | `listings.ts`, `users.ts`          |
+
+## Configuration
+
+### repomix.config.json
+
+```json
+{
+  "include": ["**/*.ts", "*.ts"],
+  "exclude": ["**/node_modules/**", "dist/**", "examples/**"],
+  "output": {
+    "format": "xml",
+    "file": "repomap_output/repomix-output.xml"
+  }
+}
 ```
 
-## Output Files
+### Environment Variables
 
-Generated in `repomap_output/`:
+- `LLM_API_KEY`: OpenRouter API key (required)
 
-- `repomix-output.xml` - Directory analysis
-- `*_base_repomap.mmd` - Current structure
-- `*_repomap.mmd` - Structure with proposed changes
-- `add_*.json` - Feature change details (with --add)
+## Viewing Diagrams
 
-View diagrams:
+1. **GitHub**: Open `.mmd` files directly (Mermaid support)
+2. **SVG Export**: Use Mermaid CLI
+   ```bash
+   mmdc -i "./repomap_output/diagram.mmd" -o "diagram.svg"
+   ```
 
-- Directly on GitHub (Mermaid support)
-- Convert to SVG: `mmdc -i "repomap.mmd" -o "repomap.svg"`
+## Troubleshooting
+
+1. **Large Codebases**: The tool uses Gemini Flash 1.5-8b specifically for its large context window to handle extensive XML files. No special handling needed.
+
+2. **API Rate Limits**: The tool includes automatic retries with exponential backoff for API calls.
+
+3. **Model Selection**: Models are pre-configured for optimal performance but can be modified in the code:
+   - `XML_PARSING_MODEL`
+   - `DIAGRAM_GENERATION_MODEL`
+   - `FEATURE_PLANNING_MODEL`
+
+## License
+
+MIT License - See LICENSE file for details
